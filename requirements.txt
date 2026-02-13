@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+gunicorn
+python-jose[cryptography]
+boto3
+psutil
+watchdog
+requests
+pydantic
+jose
