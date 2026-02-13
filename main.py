@@ -23,7 +23,8 @@ process_manager = ProcessManager()
 # -------------------------
 CORS_ORIGINS = os.getenv(
     "CORS_ORIGINS",
-    "http://localhost:5000,http://127.0.0.1:5000"
+    "http://localhost:5000,http://127.0.0.1:5000",
+    "https://cloudramsaas-frontend.onrender.com"
 ).split(",")
 
 app.add_middleware(
