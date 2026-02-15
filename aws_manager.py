@@ -3,6 +3,7 @@ import time
 import os
 import requests
 from requests.adapters import HTTPAdapter
+import botocore
 
 try:
     from urllib3.util.retry import Retry
@@ -36,34 +37,14 @@ class AWSManager:
     # Key Pair / SG / AMI
     # -------------------------
     def create_key_pair(self):
-        """Dynamically creates an EC2 key pair and saves it locally in the same directory as the running script."""
-        key_name = os.getenv("CLOUDRAM_KEYPAIR_NAME", "cloud-ram-key")
-        key_path = os.path.join(os.path.dirname(__file__), f"{key_name}.pem")
+        key_name = "cloud-ram-key"
 
         try:
-            existing_keys = self.ec2.describe_key_pairs()["KeyPairs"]
-            if any(key["KeyName"] == key_name for key in existing_keys):
-                print(f"✅ Key Pair {key_name} already exists in AWS.")
-                if not os.path.exists(key_path):
-                    print(f"❌ Key Pair {key_name} exists in AWS but the local key file is missing. Please manually create or download the key.")
-                    return None, None
-                else:
-                    print(f"✅ Key Pair Already Exists Locally: {key_path}")
-                    return key_name, key_path
-            else:
-                response = self.ec2.create_key_pair(KeyName=key_name)
-                private_key = response["KeyMaterial"]
-                print(f"🔑 New Key Pair Created in AWS: {key_name}")
-
-                print(f"📥 Downloading key pair to {key_path}...")
-                with open(key_path, "w") as key_file:
-                    key_file.write(private_key)
-                os.chmod(key_path, 0o400)
-                print(f"✅ Key Pair Saved Locally: {key_path}")
-
-                return key_name, key_path
-        except Exception as e:
-            print(f"❌ Error creating or downloading key pair: {str(e)}")
+            self.ec2.describe_key_pairs(KeyNames=[key_name])
+            print(f"✅ Key Pair {key_name} exists in AWS.")
+            return key_name, None
+        except botocore.exceptions.ClientError as e:
+            print("❌ Key pair not found in AWS:", e)
             return None, None
 
     def create_security_group(self):
@@ -251,36 +232,43 @@ class AWSManager:
     # Create VM (per user)
     # -------------------------
     def create_vm(self, ram_size: int, user_id: str):
+        r"""
+        Create a Windows VM for user_id.
+        Uses ONE shared EC2 keypair name, and downloads the PEM from S3 inside the VM via startup script.
+
+        Env:
+        CLOUDRAM_IAM_INSTANCE_PROFILE (default: CloudRAMEC2Role)
+        CLOUDRAM_KEY_BUCKET          (default: cloud-ram-secrets)
+        CLOUDRAM_KEY_OBJECT          (default: keys/cloud-ram-key.pem)
         """
-        Create a VM for a specific user_id.
-        This function DOES NOT reuse other users' instances.
-        Reuse logic should be handled in API layer by checking find_user_instance first.
-        """
+        # upload your vm_server.py (or other scripts) first
         self.upload_script_to_s3()
 
-        key_name, key_path = self.create_key_pair()
-        if not key_name or not key_path:
+        key_name, _ = self.create_key_pair()
+        if not key_name:
             print("❌ Failed to create or retrieve key pair.")
             return None, None
 
         instance_type = {1: "t3.micro", 2: "t3.small", 4: "t3.medium"}.get(ram_size, "t3.medium")
+
         startup_script_path = os.path.join("vm_scripts", "vm_startup_script.ps1")
         if not os.path.exists(startup_script_path):
             print(f"❌ Startup script not found at {startup_script_path}")
             return None, None
 
-        with open(startup_script_path, "r", encoding="utf-8") as script_file:
-            startup_script = script_file.read()
+        with open(startup_script_path, "r", encoding="utf-8") as f:
+            startup_script = f.read()
 
-        with open(key_path, "r") as key_file:
-            key_content = key_file.read()
+        key_bucket = os.getenv("CLOUDRAM_KEY_BUCKET", "cloud-ram-secrets")
+        key_object = os.getenv("CLOUDRAM_KEY_OBJECT", "keys/cloud-ram-key.pem")
 
+        # IMPORTANT: vm_startup_script.ps1 should ensure AWS CLI exists before "aws s3 cp" runs.
+        # (I showed that snippet earlier—add it near the top of vm_startup_script.ps1)
         user_data = (
             f"{startup_script}\n\n"
-            f"$keyContent = @'\n{key_content}\n'@\n"
             "New-Item -ItemType Directory -Path 'C:\\CloudRAM' -Force\n"
-            "Set-Content -Path 'C:\\CloudRAM\\cloud-ram-key.pem' -Value $keyContent -Force\n"
-            "icacls 'C:\\CloudRAM\\cloud-ram-key.pem' /inheritance:r /grant:r 'Administrators:F'"
+            f"aws s3 cp s3://{key_bucket}/{key_object} C:\\CloudRAM\\cloud-ram-key.pem\n"
+            "icacls 'C:\\CloudRAM\\cloud-ram-key.pem' /inheritance:r /grant:r 'Administrators:F'\n"
         )
 
         try:
@@ -292,6 +280,8 @@ class AWSManager:
             if not sg_id:
                 return None, None
 
+            profile_name = os.getenv("CLOUDRAM_IAM_INSTANCE_PROFILE", "CloudRAMEC2Role")
+
             print(f"🚀 Creating EC2 instance for user={user_id} with {ram_size}GB RAM ({instance_type})")
             response = self.ec2.run_instances(
                 ImageId=ami,
@@ -301,7 +291,7 @@ class AWSManager:
                 KeyName=key_name,
                 SecurityGroupIds=[sg_id],
                 UserData=user_data,
-                IamInstanceProfile={"Name": os.getenv("CLOUDRAM_IAM_INSTANCE_PROFILE", "CloudRAMEC2Role")},
+                IamInstanceProfile={"Name": profile_name},
                 TagSpecifications=[
                     {
                         "ResourceType": "instance",
@@ -320,11 +310,9 @@ class AWSManager:
             waiter = self.ec2.get_waiter("instance_running")
             waiter.wait(InstanceIds=[vm_id])
 
-            # wait for ip
             ip_address = self.wait_for_running_and_ip(vm_id)
             print(f"✅ Instance running at {ip_address}. Waiting for services...")
 
-            # wait for services
             ok = self.wait_for_vm_services(ip_address)
             if not ok:
                 self.terminate_vm(vm_id)
