@@ -2,7 +2,6 @@
 # ✅ Render backend should NOT use local Windows paths, psutil, win32*, or touch user's PC.
 # ✅ This file keeps: Auth (Supabase), AWS VM lifecycle, and VM orchestration calls.
 # ✅ Adds: pre-signed S3 URLs so Local Agent never needs AWS creds.
-# ✅ Improvement: user_id is derived ONLY from Supabase token (do not accept from client)
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -66,16 +65,16 @@ ALLOWED_S3_BUCKETS = [
     if b.strip()
 ]
 
-# Optional content-type allowlist for PUT signing
-# Example: ALLOWED_S3_CONTENT_TYPES="application/zip,text/plain,application/octet-stream"
-ALLOWED_S3_CONTENT_TYPES = set(
+# ✅ Content-Type allowlist for presigned PUT (security)
+# You hit: "application/json not allowed" for deps_hint.json
+ALLOWED_PRESIGN_CONTENT_TYPES = [
     ct.strip()
     for ct in os.getenv(
-        "ALLOWED_S3_CONTENT_TYPES",
-        "application/zip,text/plain,application/octet-stream",
+        "ALLOWED_PRESIGN_CONTENT_TYPES",
+        "application/octet-stream,application/zip,text/plain,application/json",
     ).split(",")
     if ct.strip()
-)
+]
 
 s3_client = boto3.client("s3")
 
@@ -126,14 +125,15 @@ class BeaconStopRequest(BaseModel):
     access_token: str
 
 
-# NOTE: user_id removed from requests; derived from Supabase token
 class S3SignPutRequest(BaseModel):
+    user_id: str
     bucket: str
     key: str
     content_type: str = "application/octet-stream"
 
 
 class S3SignGetRequest(BaseModel):
+    user_id: str
     bucket: str
     key: str
 
@@ -184,6 +184,15 @@ def _require_allowed_bucket(bucket: str):
         )
 
 
+def _require_allowed_content_type(content_type: str):
+    ct = (content_type or "").strip()
+    if ct not in ALLOWED_PRESIGN_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"content_type not allowed. Allowed: {', '.join(ALLOWED_PRESIGN_CONTENT_TYPES)}",
+        )
+
+
 # -------------------------
 # Basic endpoints
 # -------------------------
@@ -213,7 +222,6 @@ async def my_vm(user: dict = Depends(verify_token)):
 # =========================
 # ✅ S3 Presigned URLs (for Local Agent)
 #   Local Agent sends SB token to backend, backend signs per-user object URL.
-#   IMPORTANT: user_id is derived ONLY from token.
 # =========================
 @app.post("/s3/sign_put")
 async def s3_sign_put(req: S3SignPutRequest, user: dict = Depends(verify_token)):
@@ -221,14 +229,12 @@ async def s3_sign_put(req: S3SignPutRequest, user: dict = Depends(verify_token))
     if not token_user_id:
         raise HTTPException(status_code=401, detail="Invalid user payload (missing id)")
 
-    _require_allowed_bucket(req.bucket)
-    _require_user_scoped_key(token_user_id, req.key)
+    if req.user_id != token_user_id:
+        raise HTTPException(status_code=403, detail="user_id mismatch")
 
-    if req.content_type and (req.content_type not in ALLOWED_S3_CONTENT_TYPES):
-        raise HTTPException(
-            status_code=400,
-            detail=f"content_type not allowed. Allowed: {', '.join(sorted(ALLOWED_S3_CONTENT_TYPES))}",
-        )
+    _require_allowed_bucket(req.bucket)
+    _require_user_scoped_key(req.user_id, req.key)
+    _require_allowed_content_type(req.content_type)
 
     try:
         url = s3_client.generate_presigned_url(
@@ -257,8 +263,11 @@ async def s3_sign_get(req: S3SignGetRequest, user: dict = Depends(verify_token))
     if not token_user_id:
         raise HTTPException(status_code=401, detail="Invalid user payload (missing id)")
 
+    if req.user_id != token_user_id:
+        raise HTTPException(status_code=403, detail="user_id mismatch")
+
     _require_allowed_bucket(req.bucket)
-    _require_user_scoped_key(token_user_id, req.key)
+    _require_user_scoped_key(req.user_id, req.key)
 
     try:
         url = s3_client.generate_presigned_url(
